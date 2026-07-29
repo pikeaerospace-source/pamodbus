@@ -128,6 +128,15 @@ int pa_modbus_build_write_multiple_coils(pa_modbus_t *ctx, uint16_t addr,
     return ret == PA_OK ? framed : ret;
 }
 
+int pa_modbus_build_report_slave_id(pa_modbus_t *ctx)
+{
+    ctx->txbuf[0] = 0x11;
+    int framed;
+    int ret = ctx->framer->wrap(ctx, 1, &framed);
+    if (ret == PA_OK) ctx->tx_len = (size_t)framed;
+    return ret == PA_OK ? framed : ret;
+}
+
 int pa_modbus_build_write_multiple_registers(pa_modbus_t *ctx, uint16_t addr,
                                              const uint16_t *values, uint16_t count)
 {
