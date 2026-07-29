@@ -2,6 +2,8 @@
 
 **pamodbus** is a minimal, portable MODBUS protocol library written in C, designed for non-ASCII MODBUS only. It targets resource-constrained microcontrollers and embedded systems where every byte counts.
 
+Unlike traditional MODBUS libraries that bundle platform-specific serial/network drivers, timer abstractions, and OS dependencies, **pamodbus is pure protocol** — it parses and builds frames, period. Hardware is bridged through simple callbacks, making the library equally at home on bare-metal Cortex-M0, FreeRTOS, Linux, or any other environment. No threads, no select(), no termios, no HAL dependencies.
+
 ## Architecture
 
 The library is structured in three layers:
