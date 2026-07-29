@@ -72,6 +72,7 @@ struct pa_modbus {
     pa_framer_t        framer_type; /**< Active framer enum. */
     const pa_framer_ops_t *framer;  /**< Active framer ops table. */
     uint8_t            slave;       /**< Slave/unit identifier. */
+    uint8_t            discovery_addr; /**< Secondary listen address (0 = disabled, typically 0xF8-0xFF). */
 
     /* --- I/O callbacks --- */
     pa_send_fn send_cb;

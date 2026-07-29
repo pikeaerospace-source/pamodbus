@@ -38,8 +38,6 @@ int pa_framer_rtu_wrap(pa_modbus_t *ctx, int pdu_len, int *framed_len)
 int pa_framer_rtu_unwrap(pa_modbus_t *ctx, const uint8_t *data, size_t len,
                          const uint8_t **pdu, size_t *pdu_len)
 {
-    (void)ctx;
-
     /* Minimum frame: slave(1) + fc(1) + crc(2) = 4 bytes */
     if (len < 4) {
         /* Need more bytes; return how many more */
@@ -176,9 +174,14 @@ int pa_framer_rtu_unwrap(pa_modbus_t *ctx, const uint8_t *data, size_t len,
         return PA_ERR_CRC;
     }
 
-    /* Verify slave address matches (only if not broadcast 0xFF) */
+    /* Verify slave address matches.
+     * ctx->slave == 0xFF means "accept all" (promiscuous mode).
+     * Otherwise, check primary slave address, then fall back to
+     * discovery_addr if configured (non-standard secondary listen). */
     if (ctx->slave != 0xFF && data[0] != ctx->slave) {
-        return PA_ERR_INVALID_SLAVE;
+        /* Check discovery address as fallback */
+        if (ctx->discovery_addr == 0 || data[0] != ctx->discovery_addr)
+            return PA_ERR_INVALID_SLAVE;
     }
 
     /* Return PDU (after slave addr, before CRC) */

@@ -139,6 +139,22 @@ void   pa_modbus_set_slave(pa_modbus_t *ctx, uint8_t slave);
 uint8_t pa_modbus_get_slave(const pa_modbus_t *ctx);
 
 /* ---------------------------------------------------------------------------
+ * Discovery address (secondary listen address)
+ * ------------------------------------------------------------------------- */
+
+/**
+ * Set a secondary listen address (non-standard).
+ * When non-zero, the slave will also respond to requests addressed to this
+ * address in addition to its primary slave address. This is useful for
+ * discovery protocols using reserved MODBUS addresses (0xF8-0xFF).
+ * Default: 0 (disabled).
+ */
+void   pa_modbus_set_discovery_addr(pa_modbus_t *ctx, uint8_t addr);
+
+/** Get the secondary listen address. 0 means disabled. */
+uint8_t pa_modbus_get_discovery_addr(const pa_modbus_t *ctx);
+
+/* ---------------------------------------------------------------------------
  * I/O callback registration
  * ------------------------------------------------------------------------- */
 

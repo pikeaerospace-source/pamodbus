@@ -836,6 +836,112 @@ static void test_framer_switch(void)
 }
 
 /* ---------------------------------------------------------------------------
+ * Test: Discovery address
+ * ------------------------------------------------------------------------- */
+
+static void test_discovery_address(void)
+{
+    printf("\n=== Discovery Address Tests ===\n");
+
+    pa_modbus_t mb;
+    uint8_t txbuf[256];
+    uint8_t rxbuf[256];
+
+    /* Slave with primary address 0x01 and discovery address 0xFF */
+    setup_default(&mb, txbuf, sizeof(txbuf), rxbuf, sizeof(rxbuf), 0x01);
+    pa_modbus_set_read_holding_registers_cb(&mb, test_read_holding_cb, NULL);
+    pa_modbus_set_discovery_addr(&mb, 0xFF);
+
+    /* Default is disabled */
+    TEST_ASSERT(pa_modbus_get_discovery_addr(&mb) == 0xFF, "Discovery addr = 0xFF after set");
+
+    /* Request to primary address (0x01) should be accepted */
+    {
+        uint8_t req[] = {0x01, 0x03, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00};
+        uint16_t crc = pa_crc16(req, 6);
+        req[6] = (uint8_t)(crc & 0xFF);
+        req[7] = (uint8_t)((crc >> 8) & 0xFF);
+
+        int ret = pa_modbus_slave_feed(&mb, req, sizeof(req));
+        TEST_ASSERT(ret == PA_OK, "Primary address (0x01) accepted");
+    }
+
+    /* Request to discovery address (0xFF) should be accepted */
+    {
+        uint8_t req[] = {0xFF, 0x03, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00};
+        uint16_t crc = pa_crc16(req, 6);
+        req[6] = (uint8_t)(crc & 0xFF);
+        req[7] = (uint8_t)((crc >> 8) & 0xFF);
+
+        int ret = pa_modbus_slave_feed(&mb, req, sizeof(req));
+        TEST_ASSERT(ret == PA_OK, "Discovery address (0xFF) accepted");
+    }
+
+    /* Request to unknown address (0x02) should be rejected */
+    {
+        uint8_t req[] = {0x02, 0x03, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00};
+        uint16_t crc = pa_crc16(req, 6);
+        req[6] = (uint8_t)(crc & 0xFF);
+        req[7] = (uint8_t)((crc >> 8) & 0xFF);
+
+        int ret = pa_modbus_slave_feed(&mb, req, sizeof(req));
+        TEST_ASSERT(ret == PA_ERR_INVALID_SLAVE, "Unknown address (0x02) rejected");
+    }
+
+    /* Disable discovery address — 0xFF should now be rejected */
+    pa_modbus_set_discovery_addr(&mb, 0);
+    TEST_ASSERT(pa_modbus_get_discovery_addr(&mb) == 0, "Discovery addr disabled");
+
+    {
+        uint8_t req[] = {0xFF, 0x03, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00};
+        uint16_t crc = pa_crc16(req, 6);
+        req[6] = (uint8_t)(crc & 0xFF);
+        req[7] = (uint8_t)((crc >> 8) & 0xFF);
+
+        int ret = pa_modbus_slave_feed(&mb, req, sizeof(req));
+        TEST_ASSERT(ret == PA_ERR_INVALID_SLAVE, "0xFF rejected after discovery disabled");
+    }
+
+    /* Primary address still works after discovery disabled */
+    {
+        uint8_t req[] = {0x01, 0x03, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00};
+        uint16_t crc = pa_crc16(req, 6);
+        req[6] = (uint8_t)(crc & 0xFF);
+        req[7] = (uint8_t)((crc >> 8) & 0xFF);
+
+        int ret = pa_modbus_slave_feed(&mb, req, sizeof(req));
+        TEST_ASSERT(ret == PA_OK, "Primary address still works after discovery disabled");
+    }
+
+    /* Discovery address with TCP framer */
+    {
+        pa_modbus_t mb_tcp;
+        uint8_t tcp_tx[256], tcp_rx[256];
+        pa_modbus_init(&mb_tcp);
+        pa_modbus_set_framer(&mb_tcp, PA_FRAMER_TCP);
+        pa_modbus_set_txbuf(&mb_tcp, tcp_tx, sizeof(tcp_tx));
+        pa_modbus_set_rxbuf(&mb_tcp, tcp_rx, sizeof(tcp_rx));
+        pa_modbus_set_slave(&mb_tcp, 0x01);
+        pa_modbus_set_discovery_addr(&mb_tcp, 0xFF);
+        pa_modbus_set_read_holding_registers_cb(&mb_tcp, test_read_holding_cb, NULL);
+
+        /* TCP request to discovery address (unit ID 0xFF) 
+         * MBAP(7): trans_id(2) + proto_id(2) + length(2) + unit_id(1)
+         * PDU: fc(1) + addr(2) + count(2) = 5
+         * MBAP length field = PDU(5) + unit_id(1) = 6 */
+        uint8_t req[13] = {0};
+        req[4] = 0x00; req[5] = 0x06;  /* Length = 6 */
+        req[6] = 0xFF;                   /* Unit ID = 0xFF (discovery) */
+        req[7] = 0x03;                   /* FC 03 */
+        req[8] = 0x00; req[9] = 0x00;   /* Addr = 0 */
+        req[10] = 0x00; req[11] = 0x03; /* Count = 3 */
+
+        int ret = pa_modbus_slave_feed(&mb_tcp, req, sizeof(req));
+        TEST_ASSERT(ret == PA_OK, "TCP discovery address accepted via slave_feed");
+    }
+}
+
+/* ---------------------------------------------------------------------------
  * Test: Get/set slave address
  * ------------------------------------------------------------------------- */
 
@@ -874,6 +980,7 @@ int main(void)
     test_userdata_isolation();
     test_broadcast_address();
     test_framer_switch();
+    test_discovery_address();
     test_slave_address();
 
     printf("\n==================\n");

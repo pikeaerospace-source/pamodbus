@@ -16,6 +16,7 @@ void pa_modbus_init(pa_modbus_t *ctx)
     ctx->framer_type = PA_FRAMER_RTU;
     ctx->framer = &pa_framer_rtu_ops;
     ctx->slave = 0xFF; /* Respond to all by default */
+    ctx->discovery_addr = 0; /* Disabled by default */
     ctx->last_error = PA_OK;
 }
 
@@ -69,6 +70,20 @@ void pa_modbus_set_slave(pa_modbus_t *ctx, uint8_t slave)
 uint8_t pa_modbus_get_slave(const pa_modbus_t *ctx)
 {
     return ctx->slave;
+}
+
+/* ---------------------------------------------------------------------------
+ * Discovery address
+ * ------------------------------------------------------------------------- */
+
+void pa_modbus_set_discovery_addr(pa_modbus_t *ctx, uint8_t addr)
+{
+    ctx->discovery_addr = addr;
+}
+
+uint8_t pa_modbus_get_discovery_addr(const pa_modbus_t *ctx)
+{
+    return ctx->discovery_addr;
 }
 
 /* ---------------------------------------------------------------------------

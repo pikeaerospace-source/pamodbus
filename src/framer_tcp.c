@@ -66,9 +66,15 @@ int pa_framer_tcp_unwrap(pa_modbus_t *ctx, const uint8_t *data, size_t len,
     if (proto_id != 0)
         return PA_ERR_PROTOCOL;
 
-    /* Verify unit ID matches (only if not broadcast 0xFF) */
-    if (ctx->slave != 0xFF && data[6] != ctx->slave)
-        return PA_ERR_INVALID_SLAVE;
+    /* Verify unit ID matches.
+     * ctx->slave == 0xFF means "accept all" (promiscuous mode).
+     * Otherwise, check primary slave address, then fall back to
+     * discovery_addr if configured (non-standard secondary listen). */
+    if (ctx->slave != 0xFF && data[6] != ctx->slave) {
+        /* Check discovery address as fallback */
+        if (ctx->discovery_addr == 0 || data[6] != ctx->discovery_addr)
+            return PA_ERR_INVALID_SLAVE;
+    }
 
     /* Return PDU (after MBAP header) */
     *pdu = data + 7;
