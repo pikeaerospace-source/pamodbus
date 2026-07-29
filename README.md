@@ -125,6 +125,62 @@ typedef int (*pa_send_fn)(const uint8_t *data, size_t len, void *userdata);
 typedef int (*pa_recv_fn)(uint8_t *data, size_t max_len, void *userdata);
 ```
 
+**`pa_send_fn`** — Transmit `len` bytes from `data`. The callback should block until all bytes are
+sent or return a negative value on error. Return 0 on success.
+
+**`pa_recv_fn`** — Receive a **complete MODBUS frame** into `data` (up to `max_len` bytes).
+The library does **not** perform byte-by-byte accumulation or inter-frame timing — that is
+entirely the responsibility of this callback.
+
+- **Block until at least one byte is available.** If no data is present, the callback should
+  wait (poll or block) for the first byte.
+- **Accumulate subsequent bytes** until the MODBUS RTU inter-frame gap is detected
+  (3.5 character times of silence on the line). For TCP, a single `recv()` call is typically
+  sufficient since TCP handles message framing.
+- **Return the complete frame** in a single invocation. The library's parser expects to
+  receive the entire framed message (slave address + PDU + CRC for RTU, or MBAP header +
+  PDU for TCP) at once.
+- Return the number of bytes received on success, `0` on timeout (no data within the
+  application's timeout period), or a negative value on error.
+
+A typical RTU implementation over UART:
+
+```c
+static int uart_recv(uint8_t *data, size_t max_len, void *userdata)
+{
+    size_t len = 0;
+
+    // Block until first byte arrives
+    while (!uart_byte_available()) {
+        if (uart_timeout_expired())
+            return 0;  // timeout
+    }
+    data[len++] = uart_read_byte();
+
+    // Accumulate until 3.5 char-time gap (e.g. ~4ms at 9600 baud)
+    while (len < max_len) {
+        if (uart_byte_available()) {
+            data[len++] = uart_read_byte();
+        } else if (uart_idle_time_us() > 4000) {
+            break;  // inter-frame gap detected, frame complete
+        }
+    }
+    return (int)len;
+}
+```
+
+For TCP, the callback can simply call `recv()` since TCP provides stream-oriented delivery
+and the MBAP header contains the frame length:
+
+```c
+static int tcp_recv(uint8_t *data, size_t max_len, void *userdata)
+{
+    int fd = *(int *)userdata;
+    ssize_t n = recv(fd, data, max_len, 0);
+    return (n > 0) ? (int)n : (int)n;  // 0 = closed, -1 = error
+}
+```
+
 #### Register Access Callbacks (Slave Mode)
 
 ```c
