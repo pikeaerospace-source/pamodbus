@@ -45,7 +45,7 @@ int pa_framer_rtu_unwrap(pa_modbus_t *ctx, const uint8_t *data, size_t len,
     }
 
     /* Minimum PDU is at least 1 byte (function code) */
-    size_t min_frame = 4; /* slave + fc + crc */
+    size_t min_frame = 4; (void)min_frame; /* slave + fc + crc */
     size_t pdu_start = 1; /* after slave addr */
 
     /* The frame length depends on function code and PDU content.

@@ -19,6 +19,7 @@
 
 SRC_PAMODBUS=${SRC_ROOT}/pamodbus
 INC += -I $(SRC_PAMODBUS)/include
+INC += -I $(SRC_PAMODBUS)/src
 
 SRCS_CC += $(SRC_PAMODBUS)/src/pamodbus.c
 SRCS_CC += $(SRC_PAMODBUS)/src/pdu.c

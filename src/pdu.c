@@ -773,7 +773,7 @@ int pa_modbus_slave_respond(pa_modbus_t *ctx)
                 /* Build response by echoing request with data */
                 /* For simplicity, we copy the request and fill in data.
                  * The request format is: ref_type(1) + file_num(2) + record_num(2) + record_len(2) */
-                uint8_t req_byte_count = (uint8_t)(ctx->slave_reg_count * 2);
+                uint8_t req_byte_count = (uint8_t)(ctx->slave_reg_count * 2); (void)req_byte_count;
                 uint8_t resp_byte_count = 0;
 
                 ctx->txbuf[0] = fc;
