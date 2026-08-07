@@ -262,3 +262,72 @@ int pa_modbus_recv(pa_modbus_t *ctx)
         return pa_modbus_master_feed(ctx, ctx->rxbuf, (size_t)n);
     }
 }
+
+/* ---------------------------------------------------------------------------
+ * Raw I/O helpers — for custom protocols (e.g. discovery)
+ * ------------------------------------------------------------------------- */
+
+int pa_modbus_send_raw(pa_modbus_t *ctx, const uint8_t *pdu, size_t pdu_len)
+{
+    if (!ctx->send_cb)
+        return PA_ERR_STATE;
+    if (!ctx->txbuf)
+        return PA_ERR_STATE;
+    if (pdu_len > ctx->txbuf_size - PA_FRAMER_MAX_OVERHEAD)
+        return PA_ERR_BUFFER_FULL;
+
+    /* Copy the raw PDU into the TX buffer */
+    memcpy(ctx->txbuf, pdu, pdu_len);
+
+    /* Apply framing (adds slave address + CRC for RTU, MBAP for TCP) */
+    int framed;
+    int ret = ctx->framer->wrap(ctx, (int)pdu_len, &framed);
+    if (ret != PA_OK)
+        return ret;
+
+    ctx->tx_len = (size_t)framed;
+
+    /* Send the framed frame */
+    ret = ctx->send_cb(ctx->txbuf, ctx->tx_len, ctx->send_userdata);
+    return (ret == 0) ? (int)ctx->tx_len : PA_ERR_CALLBACK;
+}
+
+int pa_modbus_recv_raw(pa_modbus_t *ctx, uint8_t *pdu_buf, size_t *pdu_len)
+{
+    if (!ctx->recv_cb)
+        return PA_ERR_STATE;
+    if (!ctx->rxbuf || !pdu_buf || !pdu_len)
+        return PA_ERR_BAD_PARAM;
+
+    size_t capacity = *pdu_len;
+    size_t total = 0;
+
+    /* Accumulate bytes until the framer unwrap succeeds */
+    for (;;) {
+        int n = ctx->recv_cb(ctx->rxbuf + total, ctx->rxbuf_size - total, ctx->recv_userdata);
+        if (n < 0)
+            return PA_ERR_CALLBACK;
+        if (n == 0)
+            return PA_ERR_TIMEOUT;
+
+        total += (size_t)n;
+
+        /* Try to unwrap the accumulated data */
+        const uint8_t *pdu;
+        size_t pdu_len_out;
+        int ret = ctx->framer->unwrap(ctx, ctx->rxbuf, total, &pdu, &pdu_len_out);
+        if (ret < 0)
+            return ret;
+        if (ret == 0) {
+            /* Complete frame received — copy the PDU out */
+            if (pdu_len_out > capacity)
+                return PA_ERR_BUFFER_FULL;
+            memcpy(pdu_buf, pdu, pdu_len_out);
+            *pdu_len = pdu_len_out;
+            return PA_OK;
+        }
+        /* ret > 0: still need more bytes */
+        if (total >= ctx->rxbuf_size)
+            return PA_ERR_BUFFER_FULL;
+    }
+}

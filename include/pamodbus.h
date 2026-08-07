@@ -260,11 +260,32 @@ int pa_modbus_slave_respond_error(pa_modbus_t *ctx, uint8_t exception_code);
  * Convenience I/O helpers
  * ------------------------------------------------------------------------- */
 
-/** Send the TX buffer using the registered send callback. */
+ /** Send the TX buffer using the registered send callback. */
 int pa_modbus_send(pa_modbus_t *ctx);
 
 /** Receive data and feed it to the active parser (master or slave). */
 int pa_modbus_recv(pa_modbus_t *ctx);
+
+/**
+ * Send raw bytes with framing applied.
+ * Packs the data as the PDU portion; the framer adds slave address + CRC (RTU)
+ * or MBAP header (TCP).
+ * @param ctx       The MODBUS context.
+ * @param pdu       Raw PDU bytes to send (function code + payload).
+ * @param pdu_len   Length of the PDU.
+ * @return Framed length on success, or negative pa_error_t on failure.
+ */
+int pa_modbus_send_raw(pa_modbus_t *ctx, const uint8_t *pdu, size_t pdu_len);
+
+/**
+ * Receive raw bytes and strip framing.
+ * Blocks until a valid framed message is received.
+ * @param ctx       The MODBUS context.
+ * @param pdu_buf   Buffer to receive the PDU (framing stripped).
+ * @param pdu_len   In: capacity of pdu_buf. Out: actual PDU length received.
+ * @return PA_OK on success, or negative pa_error_t on failure.
+ */
+int pa_modbus_recv_raw(pa_modbus_t *ctx, uint8_t *pdu_buf, size_t *pdu_len);
 
 /* ---------------------------------------------------------------------------
  * CRC-16
