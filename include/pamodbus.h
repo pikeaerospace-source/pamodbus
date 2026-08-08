@@ -190,6 +190,9 @@ int pa_modbus_build_write_single_register(  pa_modbus_t *ctx, uint16_t addr, uin
 int pa_modbus_build_write_multiple_coils(   pa_modbus_t *ctx, uint16_t addr, const uint8_t *values, uint16_t count);
 int pa_modbus_build_write_multiple_registers(pa_modbus_t *ctx, uint16_t addr, const uint16_t *values, uint16_t count);
 int pa_modbus_build_report_slave_id(pa_modbus_t *ctx);
+int pa_modbus_build_mask_write_register(pa_modbus_t *ctx, uint16_t addr, uint16_t and_mask, uint16_t or_mask);
+int pa_modbus_build_read_write_registers(pa_modbus_t *ctx, uint16_t read_addr, uint16_t read_count,
+                                         uint16_t write_addr, const uint16_t *write_values, uint16_t write_count);
 
 /** Get pointer to the framed TX buffer after build. */
 const uint8_t *pa_modbus_tx_buf(const pa_modbus_t *ctx);

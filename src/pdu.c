@@ -137,6 +137,44 @@ int pa_modbus_build_report_slave_id(pa_modbus_t *ctx)
     return ret == PA_OK ? framed : ret;
 }
 
+int pa_modbus_build_mask_write_register(pa_modbus_t *ctx, uint16_t addr, uint16_t and_mask, uint16_t or_mask)
+{
+    ctx->txbuf[0] = 0x16;
+    put16(ctx->txbuf + 1, addr);
+    put16(ctx->txbuf + 3, and_mask);
+    put16(ctx->txbuf + 5, or_mask);
+    int framed;
+    int ret = ctx->framer->wrap(ctx, 7, &framed);
+    if (ret == PA_OK) ctx->tx_len = (size_t)framed;
+    return ret == PA_OK ? framed : ret;
+}
+
+int pa_modbus_build_read_write_registers(pa_modbus_t *ctx, uint16_t read_addr, uint16_t read_count,
+                                         uint16_t write_addr, const uint16_t *write_values, uint16_t write_count)
+{
+    if (read_count < 1 || read_count > 125) return PA_ERR_BAD_PARAM;
+    if (write_count < 1 || write_count > 121) return PA_ERR_BAD_PARAM;
+    if (!write_values) return PA_ERR_BAD_PARAM;
+
+    uint16_t byte_count = (uint16_t)(write_count * 2);
+    size_t pdu_len = (size_t)(10 + byte_count);
+    if (pdu_len > ctx->txbuf_size) return PA_ERR_BUFFER_FULL;
+
+    ctx->txbuf[0] = 0x17;
+    put16(ctx->txbuf + 1, read_addr);
+    put16(ctx->txbuf + 3, read_count);
+    put16(ctx->txbuf + 5, write_addr);
+    put16(ctx->txbuf + 7, write_count);
+    ctx->txbuf[9] = (uint8_t)byte_count;
+    for (uint16_t i = 0; i < write_count; i++)
+        put16(ctx->txbuf + 10 + i * 2, write_values[i]);
+
+    int framed;
+    int ret = ctx->framer->wrap(ctx, (int)pdu_len, &framed);
+    if (ret == PA_OK) ctx->tx_len = (size_t)framed;
+    return ret == PA_OK ? framed : ret;
+}
+
 int pa_modbus_build_write_multiple_registers(pa_modbus_t *ctx, uint16_t addr,
                                              const uint16_t *values, uint16_t count)
 {

@@ -196,6 +196,48 @@ static void test_pdu_build(void)
         TEST_ASSERT(buf[11] == 0x00 && buf[12] == 0x03, "FC10 val[2] = 3");
     }
 
+    /* Mask Write Register (FC 16) */
+    {
+        int len = pa_modbus_build_mask_write_register(&mb, 0x1234, 0xFF00, 0x00FF);
+        TEST_ASSERT(len == 10, "FC16 RTU frame length is 10");
+        const uint8_t *buf = pa_modbus_tx_buf(&mb);
+        TEST_ASSERT(buf[1] == 0x16, "FC16 function code");
+        TEST_ASSERT(buf[2] == 0x12 && buf[3] == 0x34, "FC16 addr = 0x1234");
+        TEST_ASSERT(buf[4] == 0xFF && buf[5] == 0x00, "FC16 AND mask = 0xFF00");
+        TEST_ASSERT(buf[6] == 0x00 && buf[7] == 0xFF, "FC16 OR mask = 0x00FF");
+    }
+
+    /* Read/Write Multiple Registers (FC 17) */
+    {
+        uint16_t write_values[] = {0xAAAA, 0xBBBB, 0xCCCC};
+        int len = pa_modbus_build_read_write_registers(&mb, 0x100, 2, 0x200, write_values, 3);
+        TEST_ASSERT(len == 19, "FC17 RTU frame length is 19");
+        const uint8_t *buf = pa_modbus_tx_buf(&mb);
+        TEST_ASSERT(buf[1] == 0x17, "FC17 function code");
+        TEST_ASSERT(buf[2] == 0x01 && buf[3] == 0x00, "FC17 read addr = 0x0100");
+        TEST_ASSERT(buf[4] == 0x00 && buf[5] == 0x02, "FC17 read count = 2");
+        TEST_ASSERT(buf[6] == 0x02 && buf[7] == 0x00, "FC17 write addr = 0x0200");
+        TEST_ASSERT(buf[8] == 0x00 && buf[9] == 0x03, "FC17 write count = 3");
+        TEST_ASSERT(buf[10] == 0x06, "FC17 byte count = 6");
+        TEST_ASSERT(buf[11] == 0xAA && buf[12] == 0xAA, "FC17 write val[0] = 0xAAAA");
+        TEST_ASSERT(buf[15] == 0xCC && buf[16] == 0xCC, "FC17 write val[2] = 0xCCCC");
+    }
+
+    /* FC 17 parameter validation */
+    {
+        uint16_t write_values[] = {1};
+        int len = pa_modbus_build_read_write_registers(&mb, 0, 0, 0, write_values, 1);
+        TEST_ASSERT(len == PA_ERR_BAD_PARAM, "FC17 read_count=0 returns error");
+        len = pa_modbus_build_read_write_registers(&mb, 0, 1, 0, NULL, 1);
+        TEST_ASSERT(len == PA_ERR_BAD_PARAM, "FC17 NULL write_values returns error");
+        len = pa_modbus_build_read_write_registers(&mb, 0, 1, 0, write_values, 0);
+        TEST_ASSERT(len == PA_ERR_BAD_PARAM, "FC17 write_count=0 returns error");
+        len = pa_modbus_build_read_write_registers(&mb, 0, 126, 0, write_values, 1);
+        TEST_ASSERT(len == PA_ERR_BAD_PARAM, "FC17 read_count=126 returns error");
+        len = pa_modbus_build_read_write_registers(&mb, 0, 1, 0, write_values, 122);
+        TEST_ASSERT(len == PA_ERR_BAD_PARAM, "FC17 write_count=122 returns error");
+    }
+
     /* Maximum valid parameters */
     {
         int len = pa_modbus_build_read_coils(&mb, 0, 2000);
