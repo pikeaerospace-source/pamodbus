@@ -118,10 +118,37 @@ int pa_framer_rtu_unwrap(pa_modbus_t *ctx, const uint8_t *data, size_t len,
             expected_len = 8;
             break;
 
-        /* Report Server ID (FC 11): response variable; request = 4 bytes (slave+fc+crc?) 
-         * Actually FC 11 request is just slave + fc + crc = 4 bytes */
+        /* Report Server ID (FC 11):
+         * Request:  slave(1) + fc(1) + crc(2) = 4 bytes
+         * Response: slave(1) + fc(1) + byte_count(1) + data(N) + crc(2)
+         * Custom discovery frames may use FC 0x11 with arbitrary PDU data.
+         * Distinguish:
+         *   - len == 4: standard request (slave+fc+crc)
+         *   - len == 5: custom 1-byte PDU (e.g., discovery probe)
+         *   - len > 5:  if data[2] is a valid byte_count that matches the frame
+         *               length, treat as standard response; otherwise accept
+         *               as custom protocol frame. */
         case 0x11:
-            expected_len = 4;
+            if (len == 4) {
+                /* Standard request: slave + fc + crc = 4 bytes */
+                expected_len = 4;
+            } else if (len == 5) {
+                /* Custom 1-byte PDU: slave(1) + fc(1) + data(1) + crc(2) = 5 */
+                expected_len = 5;
+            } else if (len > 5) {
+                /* Could be a response with byte_count or a custom frame */
+                uint8_t bc = data[2];
+                if (bc > 0 && bc <= 250 && (size_t)(3 + bc + 2) <= len) {
+                    /* Response with byte_count that fits */
+                    expected_len = (size_t)(3 + bc + 2);
+                } else {
+                    /* Custom protocol frame — accept at current length */
+                    expected_len = len;
+                }
+            } else {
+                /* Need more data */
+                return (int)(4 - len);
+            }
             break;
 
         /* FC 14, 15: Read/Write File Record — more complex. For now require at least 8 */

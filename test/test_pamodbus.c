@@ -942,6 +942,361 @@ static void test_discovery_address(void)
 }
 
 /* ---------------------------------------------------------------------------
+ * Test: Raw I/O helpers (pa_modbus_send_raw / pa_modbus_recv_raw)
+ * ------------------------------------------------------------------------- */
+
+/* Simple in-memory loopback for testing raw I/O */
+static uint8_t loopback_tx[256];
+static size_t loopback_tx_len = 0;
+static uint8_t loopback_rx[256];
+static size_t loopback_rx_len = 0;
+static size_t loopback_rx_pos = 0;
+
+static int loopback_send_cb(const uint8_t *data, size_t len, void *userdata)
+{
+    (void)userdata;
+    if (len > sizeof(loopback_tx)) return -1;
+    memcpy(loopback_tx, data, len);
+    loopback_tx_len = len;
+    return 0;
+}
+
+static int loopback_recv_cb(uint8_t *data, size_t max_len, void *userdata)
+{
+    (void)userdata;
+    size_t remaining = loopback_rx_len - loopback_rx_pos;
+    if (remaining == 0) return 0;
+    size_t n = remaining < max_len ? remaining : max_len;
+    memcpy(data, loopback_rx + loopback_rx_pos, n);
+    loopback_rx_pos += n;
+    return (int)n;
+}
+
+static void test_raw_io(void)
+{
+    printf("\n=== Raw I/O Tests ===\n");
+
+    pa_modbus_t mb;
+    uint8_t txbuf[256];
+    uint8_t rxbuf[256];
+    setup_default(&mb, txbuf, sizeof(txbuf), rxbuf, sizeof(rxbuf), 0x01);
+    pa_modbus_set_send_cb(&mb, loopback_send_cb, NULL);
+    pa_modbus_set_recv_cb(&mb, loopback_recv_cb, NULL);
+
+    /* Send raw PDU with RTU framing */
+    {
+        uint8_t pdu[] = {0x11, 0xAA, 0xBB}; /* Custom discovery frame */
+        int ret = pa_modbus_send_raw(&mb, pdu, sizeof(pdu));
+        TEST_ASSERT(ret > 0, "send_raw returns positive framed length");
+        TEST_ASSERT((size_t)ret == loopback_tx_len, "send_raw sent correct length");
+        TEST_ASSERT(loopback_tx[0] == 0x01, "RTU slave addr = 0x01");
+        TEST_ASSERT(loopback_tx[1] == 0x11, "PDU byte 0 = 0x11");
+        TEST_ASSERT(loopback_tx[2] == 0xAA, "PDU byte 1 = 0xAA");
+        TEST_ASSERT(loopback_tx[3] == 0xBB, "PDU byte 2 = 0xBB");
+
+        /* Verify CRC */
+        uint16_t crc_calc = pa_crc16(loopback_tx, 4);
+        uint16_t crc_frame = (uint16_t)(loopback_tx[4] | ((uint16_t)loopback_tx[5] << 8));
+        TEST_ASSERT(crc_calc == crc_frame, "send_raw CRC is correct");
+    }
+
+    /* Send raw with buffer overflow */
+    {
+        uint8_t big_pdu[300];
+        memset(big_pdu, 0, sizeof(big_pdu));
+        int ret = pa_modbus_send_raw(&mb, big_pdu, sizeof(big_pdu));
+        TEST_ASSERT(ret == PA_ERR_BUFFER_FULL, "send_raw buffer overflow returns PA_ERR_BUFFER_FULL");
+    }
+
+    /* Send raw without send callback */
+    {
+        pa_modbus_t mb2;
+        uint8_t tx2[64], rx2[64];
+        setup_default(&mb2, tx2, sizeof(tx2), rx2, sizeof(rx2), 0x01);
+        uint8_t pdu[] = {0x11};
+        int ret = pa_modbus_send_raw(&mb2, pdu, sizeof(pdu));
+        TEST_ASSERT(ret == PA_ERR_STATE, "send_raw without callback returns PA_ERR_STATE");
+    }
+
+    /* Receive raw with RTU framing */
+    {
+        /* Build a framed response: slave=0x01, PDU={0x11, 0x01, 0x02}, CRC */
+        uint8_t frame[6];
+        frame[0] = 0x01;
+        frame[1] = 0x11;
+        frame[2] = 0x01;
+        frame[3] = 0x02;
+        uint16_t crc = pa_crc16(frame, 4);
+        frame[4] = (uint8_t)(crc & 0xFF);
+        frame[5] = (uint8_t)((crc >> 8) & 0xFF);
+
+        memcpy(loopback_rx, frame, sizeof(frame));
+        loopback_rx_len = sizeof(frame);
+        loopback_rx_pos = 0;
+
+        uint8_t pdu_buf[64];
+        size_t pdu_len = sizeof(pdu_buf);
+        int ret = pa_modbus_recv_raw(&mb, pdu_buf, &pdu_len);
+        TEST_ASSERT(ret == PA_OK, "recv_raw returns PA_OK");
+        TEST_ASSERT(pdu_len == 3, "recv_raw PDU length = 3");
+        TEST_ASSERT(pdu_buf[0] == 0x11, "recv_raw PDU[0] = 0x11");
+        TEST_ASSERT(pdu_buf[1] == 0x01, "recv_raw PDU[1] = 0x01");
+        TEST_ASSERT(pdu_buf[2] == 0x02, "recv_raw PDU[2] = 0x02");
+    }
+
+    /* Receive raw with timeout (no data) */
+    {
+        loopback_rx_len = 0;
+        loopback_rx_pos = 0;
+        uint8_t pdu_buf[64];
+        size_t pdu_len = sizeof(pdu_buf);
+        int ret = pa_modbus_recv_raw(&mb, pdu_buf, &pdu_len);
+        TEST_ASSERT(ret == PA_ERR_TIMEOUT, "recv_raw timeout returns PA_ERR_TIMEOUT");
+    }
+
+    /* Receive raw with bad CRC */
+    {
+        uint8_t frame[6];
+        frame[0] = 0x01;
+        frame[1] = 0x11;
+        frame[2] = 0x01;
+        frame[3] = 0x02;
+        frame[4] = 0xFF; /* Bad CRC */
+        frame[5] = 0xFF;
+
+        memcpy(loopback_rx, frame, sizeof(frame));
+        loopback_rx_len = sizeof(frame);
+        loopback_rx_pos = 0;
+
+        uint8_t pdu_buf[64];
+        size_t pdu_len = sizeof(pdu_buf);
+        int ret = pa_modbus_recv_raw(&mb, pdu_buf, &pdu_len);
+        TEST_ASSERT(ret == PA_ERR_TIMEOUT, "recv_raw bad CRC returns PA_ERR_TIMEOUT (no valid frame found)");
+    }
+}
+
+/* ---------------------------------------------------------------------------
+ * Test: FC 0x11 (Report Slave ID)
+ * ------------------------------------------------------------------------- */
+
+static void test_report_slave_id(void)
+{
+    printf("\n=== Report Slave ID (FC 0x11) Tests ===\n");
+
+    pa_modbus_t mb;
+    uint8_t txbuf[256];
+    uint8_t rxbuf[256];
+    setup_default(&mb, txbuf, sizeof(txbuf), rxbuf, sizeof(rxbuf), 0x01);
+
+    /* Build FC 0x11 request */
+    {
+        int len = pa_modbus_build_report_slave_id(&mb);
+        TEST_ASSERT(len == 4, "FC11 RTU frame length = 4");
+        const uint8_t *buf = pa_modbus_tx_buf(&mb);
+        TEST_ASSERT(buf[0] == 0x01, "FC11 slave addr = 0x01");
+        TEST_ASSERT(buf[1] == 0x11, "FC11 function code = 0x11");
+
+        uint16_t crc_calc = pa_crc16(buf, 2);
+        uint16_t crc_frame = (uint16_t)(buf[2] | ((uint16_t)buf[3] << 8));
+        TEST_ASSERT(crc_calc == crc_frame, "FC11 CRC is correct");
+    }
+
+    /* Parse FC 0x11 response */
+    {
+        /* Response: slave=0x01, FC=0x11, byte_count=3, data={0x01, 0xAA, 0xBB} */
+        uint8_t resp[] = {0x01, 0x11, 0x03, 0x01, 0xAA, 0xBB, 0x00, 0x00};
+        uint16_t crc = pa_crc16(resp, 6);
+        resp[6] = (uint8_t)(crc & 0xFF);
+        resp[7] = (uint8_t)((crc >> 8) & 0xFF);
+
+        int ret = pa_modbus_master_feed(&mb, resp, sizeof(resp));
+        TEST_ASSERT(ret == PA_OK, "FC11 response parse OK");
+        TEST_ASSERT(pa_modbus_get_register(&mb, 0) == 0x01AA, "FC11 data[0..1] = 0x01AA");
+        TEST_ASSERT(pa_modbus_get_register(&mb, 1) == 0x00BB, "FC11 data[2] padded = 0x00BB");
+    }
+}
+
+/* ---------------------------------------------------------------------------
+ * Test: Discovery handshake (master + slave loopback)
+ * ------------------------------------------------------------------------- */
+
+/* Slave-side discovery handler: responds to DISCO_REQ with its serial number */
+static uint8_t slave_serial[6] = {0x01, 0x02, 0x03, 0x04, 0x05, 0x06};
+static uint8_t slave_assigned_id = 0x00;
+
+static int disco_slave_send_cb(const uint8_t *data, size_t len, void *userdata)
+{
+    (void)userdata;
+    if (len > sizeof(loopback_tx)) return -1;
+    memcpy(loopback_tx, data, len);
+    loopback_tx_len = len;
+    return 0;
+}
+
+static int disco_slave_recv_cb(uint8_t *data, size_t max_len, void *userdata)
+{
+    (void)userdata;
+    size_t remaining = loopback_rx_len - loopback_rx_pos;
+    if (remaining == 0) return 0;
+    size_t n = remaining < max_len ? remaining : max_len;
+    memcpy(data, loopback_rx + loopback_rx_pos, n);
+    loopback_rx_pos += n;
+    return (int)n;
+}
+
+static void test_discovery_handshake(void)
+{
+    printf("\n=== Discovery Handshake Tests ===\n");
+
+    /* Master context */
+    pa_modbus_t master;
+    uint8_t master_tx[256], master_rx[256];
+    setup_default(&master, master_tx, sizeof(master_tx), master_rx, sizeof(master_rx), 0xFF);
+    pa_modbus_set_send_cb(&master, loopback_send_cb, NULL);
+    pa_modbus_set_recv_cb(&master, loopback_recv_cb, NULL);
+
+    /* Slave context with discovery address 0xFF */
+    pa_modbus_t slave;
+    uint8_t slave_tx[256], slave_rx[256];
+    setup_default(&slave, slave_tx, sizeof(slave_tx), slave_rx, sizeof(slave_rx), 0x00);
+    pa_modbus_set_discovery_addr(&slave, 0xFF);
+    pa_modbus_set_send_cb(&slave, disco_slave_send_cb, NULL);
+    pa_modbus_set_recv_cb(&slave, disco_slave_recv_cb, NULL);
+
+    /* Step 1: Master sends DISCO_REQ to 0xFF via raw I/O */
+    {
+        /* DISCO_REQ PDU: {0x11, 0x01} — FC 0x11 (Report Slave ID) as discovery probe */
+        uint8_t disco_req[] = {0x11, 0x01};
+        int ret = pa_modbus_send_raw(&master, disco_req, sizeof(disco_req));
+        TEST_ASSERT(ret > 0, "Master sends DISCO_REQ via send_raw");
+
+        /* Copy master's framed output to slave's receive buffer */
+        memcpy(loopback_rx, loopback_tx, loopback_tx_len);
+        loopback_rx_len = loopback_tx_len;
+        loopback_rx_pos = 0;
+
+        /* Slave receives and parses the DISCO_REQ */
+        uint8_t pdu_buf[64];
+        size_t pdu_len = sizeof(pdu_buf);
+        ret = pa_modbus_recv_raw(&slave, pdu_buf, &pdu_len);
+        TEST_ASSERT(ret == PA_OK, "Slave receives DISCO_REQ via recv_raw");
+        TEST_ASSERT(pdu_len == 2, "DISCO_REQ PDU length = 2");
+        TEST_ASSERT(pdu_buf[0] == 0x11, "DISCO_REQ FC = 0x11");
+        TEST_ASSERT(pdu_buf[1] == 0x01, "DISCO_REQ probe = 0x01");
+    }
+
+    /* Step 2: Slave responds with its serial number */
+    {
+        /* DISCO_RSP PDU: {0x11, 0x02, serial[0..5]} */
+        uint8_t disco_rsp[8];
+        disco_rsp[0] = 0x11;
+        disco_rsp[1] = 0x02;
+        memcpy(&disco_rsp[2], slave_serial, 6);
+
+        int ret = pa_modbus_send_raw(&slave, disco_rsp, sizeof(disco_rsp));
+        TEST_ASSERT(ret > 0, "Slave sends DISCO_RSP via send_raw");
+
+        /* Copy slave's framed output to master's receive buffer */
+        memcpy(loopback_rx, loopback_tx, loopback_tx_len);
+        loopback_rx_len = loopback_tx_len;
+        loopback_rx_pos = 0;
+
+        /* Master receives and parses the DISCO_RSP */
+        uint8_t pdu_buf[64];
+        size_t pdu_len = sizeof(pdu_buf);
+        ret = pa_modbus_recv_raw(&master, pdu_buf, &pdu_len);
+        TEST_ASSERT(ret == PA_OK, "Master receives DISCO_RSP via recv_raw");
+        TEST_ASSERT(pdu_len == 8, "DISCO_RSP PDU length = 8");
+        TEST_ASSERT(pdu_buf[0] == 0x11, "DISCO_RSP FC = 0x11");
+        TEST_ASSERT(pdu_buf[1] == 0x02, "DISCO_RSP type = 0x02");
+        TEST_ASSERT(memcmp(&pdu_buf[2], slave_serial, 6) == 0, "DISCO_RSP serial matches");
+    }
+
+    /* Step 3: Master assigns slave ID via ASSIGN_REQ */
+    {
+        /* ASSIGN_REQ PDU: {0x11, 0x03, new_id, serial[0..5]} */
+        uint8_t assign_req[9];
+        assign_req[0] = 0x11;
+        assign_req[1] = 0x03;
+        assign_req[2] = 0x07; /* New slave ID */
+        memcpy(&assign_req[3], slave_serial, 6);
+
+        int ret = pa_modbus_send_raw(&master, assign_req, sizeof(assign_req));
+        TEST_ASSERT(ret > 0, "Master sends ASSIGN_REQ via send_raw");
+
+        /* Copy master's framed output to slave's receive buffer */
+        memcpy(loopback_rx, loopback_tx, loopback_tx_len);
+        loopback_rx_len = loopback_tx_len;
+        loopback_rx_pos = 0;
+
+        /* Slave receives and parses the ASSIGN_REQ */
+        uint8_t pdu_buf[64];
+        size_t pdu_len = sizeof(pdu_buf);
+        ret = pa_modbus_recv_raw(&slave, pdu_buf, &pdu_len);
+        TEST_ASSERT(ret == PA_OK, "Slave receives ASSIGN_REQ via recv_raw");
+        TEST_ASSERT(pdu_len == 9, "ASSIGN_REQ PDU length = 9");
+        TEST_ASSERT(pdu_buf[0] == 0x11, "ASSIGN_REQ FC = 0x11");
+        TEST_ASSERT(pdu_buf[1] == 0x03, "ASSIGN_REQ type = 0x03");
+        TEST_ASSERT(pdu_buf[2] == 0x07, "ASSIGN_REQ new ID = 0x07");
+        TEST_ASSERT(memcmp(&pdu_buf[3], slave_serial, 6) == 0, "ASSIGN_REQ serial matches");
+
+        /* Slave updates its assigned ID */
+        slave_assigned_id = pdu_buf[2];
+        pa_modbus_set_slave(&slave, slave_assigned_id);
+        TEST_ASSERT(pa_modbus_get_slave(&slave) == 0x07, "Slave ID updated to 0x07");
+    }
+
+    /* Step 4: Slave confirms assignment */
+    {
+        /* ASSIGN_RSP PDU: {0x11, 0x04, new_id} */
+        uint8_t assign_rsp[3];
+        assign_rsp[0] = 0x11;
+        assign_rsp[1] = 0x04;
+        assign_rsp[2] = slave_assigned_id;
+
+        int ret = pa_modbus_send_raw(&slave, assign_rsp, sizeof(assign_rsp));
+        TEST_ASSERT(ret > 0, "Slave sends ASSIGN_RSP via send_raw");
+
+        /* Copy slave's framed output to master's receive buffer */
+        memcpy(loopback_rx, loopback_tx, loopback_tx_len);
+        loopback_rx_len = loopback_tx_len;
+        loopback_rx_pos = 0;
+
+        /* Master receives and parses the ASSIGN_RSP */
+        uint8_t pdu_buf[64];
+        size_t pdu_len = sizeof(pdu_buf);
+        ret = pa_modbus_recv_raw(&master, pdu_buf, &pdu_len);
+        TEST_ASSERT(ret == PA_OK, "Master receives ASSIGN_RSP via recv_raw");
+        TEST_ASSERT(pdu_len == 3, "ASSIGN_RSP PDU length = 3");
+        TEST_ASSERT(pdu_buf[0] == 0x11, "ASSIGN_RSP FC = 0x11");
+        TEST_ASSERT(pdu_buf[1] == 0x04, "ASSIGN_RSP type = 0x04");
+        TEST_ASSERT(pdu_buf[2] == 0x07, "ASSIGN_RSP confirmed ID = 0x07");
+    }
+
+    /* Step 5: Normal Modbus operation on assigned ID */
+    {
+        /* Master builds a standard FC03 read request to slave 0x07 */
+        pa_modbus_set_slave(&master, 0x07);
+        int len = pa_modbus_build_read_holding_registers(&master, 0, 3);
+        TEST_ASSERT(len == 8, "Master builds FC03 to assigned slave");
+
+        /* Send the built frame through the master's send callback */
+        int ret = pa_modbus_send(&master);
+        TEST_ASSERT(ret == PA_OK, "Master sends FC03 via pa_modbus_send");
+
+        /* Copy master's framed output to slave's receive buffer */
+        memcpy(loopback_rx, loopback_tx, loopback_tx_len);
+        loopback_rx_len = loopback_tx_len;
+        loopback_rx_pos = 0;
+
+        /* Slave receives the FC03 request */
+        ret = pa_modbus_slave_feed(&slave, loopback_rx, loopback_rx_len);
+        TEST_ASSERT(ret == PA_OK, "Slave accepts FC03 on assigned ID");
+        TEST_ASSERT(pa_modbus_slave_function(&slave) == 0x03, "Slave sees FC03");
+    }
+}
+
+/* ---------------------------------------------------------------------------
  * Test: Get/set slave address
  * ------------------------------------------------------------------------- */
 
@@ -981,6 +1336,9 @@ int main(void)
     test_broadcast_address();
     test_framer_switch();
     test_discovery_address();
+    test_raw_io();
+    test_report_slave_id();
+    test_discovery_handshake();
     test_slave_address();
 
     printf("\n==================\n");

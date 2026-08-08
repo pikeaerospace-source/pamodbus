@@ -302,7 +302,12 @@ int pa_modbus_recv_raw(pa_modbus_t *ctx, uint8_t *pdu_buf, size_t *pdu_len)
     size_t capacity = *pdu_len;
     size_t total = 0;
 
-    /* Accumulate bytes until the framer unwrap succeeds */
+    /* Accumulate bytes until a valid framed message is received.
+     * For raw I/O, we use a simpler approach than the framer's unwrap:
+     * we accumulate bytes and try to find a valid frame by checking
+     * the CRC at each possible frame length. This works for custom
+     * protocol frames (e.g., discovery) that don't follow standard
+     * MODBUS function code length rules. */
     for (;;) {
         int n = ctx->recv_cb(ctx->rxbuf + total, ctx->rxbuf_size - total, ctx->recv_userdata);
         if (n < 0)
@@ -312,21 +317,30 @@ int pa_modbus_recv_raw(pa_modbus_t *ctx, uint8_t *pdu_buf, size_t *pdu_len)
 
         total += (size_t)n;
 
-        /* Try to unwrap the accumulated data */
-        const uint8_t *pdu;
-        size_t pdu_len_out;
-        int ret = ctx->framer->unwrap(ctx, ctx->rxbuf, total, &pdu, &pdu_len_out);
-        if (ret < 0)
-            return ret;
-        if (ret == 0) {
-            /* Complete frame received — copy the PDU out */
-            if (pdu_len_out > capacity)
-                return PA_ERR_BUFFER_FULL;
-            memcpy(pdu_buf, pdu, pdu_len_out);
-            *pdu_len = pdu_len_out;
-            return PA_OK;
+        /* Minimum frame: slave(1) + fc(1) + crc(2) = 4 bytes */
+        if (total >= 4) {
+            /* Try to find a valid frame by checking CRC at each possible length.
+             * The frame is: slave(1) + PDU(N) + crc(2).
+             * We try lengths from 4 up to total, checking if the CRC matches. */
+            for (size_t frame_len = 4; frame_len <= total; frame_len++) {
+                /* Verify CRC for this frame length */
+                uint16_t crc_received = (uint16_t)(ctx->rxbuf[frame_len - 2] |
+                                                   ((uint16_t)ctx->rxbuf[frame_len - 1] << 8));
+                uint16_t crc_calc = pa_crc16(ctx->rxbuf, frame_len - 2);
+
+                if (crc_calc == crc_received) {
+                    /* Valid frame found — extract PDU (after slave addr, before CRC) */
+                    size_t pdu_len_out = frame_len - 1 - 2; /* subtract slave and CRC */
+                    if (pdu_len_out > capacity)
+                        return PA_ERR_BUFFER_FULL;
+                    memcpy(pdu_buf, ctx->rxbuf + 1, pdu_len_out);
+                    *pdu_len = pdu_len_out;
+                    return PA_OK;
+                }
+            }
         }
-        /* ret > 0: still need more bytes */
+
+        /* Check if we've filled the buffer without finding a valid frame */
         if (total >= ctx->rxbuf_size)
             return PA_ERR_BUFFER_FULL;
     }
