@@ -1014,6 +1014,54 @@ static int loopback_recv_cb(uint8_t *data, size_t max_len, void *userdata)
     return (int)n;
 }
 
+/* ---------------------------------------------------------------------------
+ * Simulated time + chunked receive producer (for the non-blocking receiver).
+ *
+ * test_tick is advanced manually by the test to drive idle-timeout behaviour.
+ * rxp_* emulates a UART that delivers a frame in controllable chunks across
+ * successive recv_cb() drains (rxp_chunk == 0 means "deliver everything now").
+ * ------------------------------------------------------------------------- */
+static uint32_t test_tick = 0;
+static uint32_t test_ticks_cb(void *userdata) { (void)userdata; return test_tick; }
+
+static uint8_t  rxp_data[256];
+static size_t   rxp_len = 0;
+static size_t   rxp_pos = 0;
+static size_t   rxp_chunk = 0;
+
+static void rxp_load(const uint8_t *data, size_t len, size_t chunk)
+{
+    if (len > sizeof(rxp_data)) len = sizeof(rxp_data);
+    memcpy(rxp_data, data, len);
+    rxp_len = len;
+    rxp_pos = 0;
+    rxp_chunk = chunk;
+}
+
+static int chunked_recv_cb(uint8_t *data, size_t max_len, void *userdata)
+{
+    (void)userdata;
+    size_t remaining = rxp_len - rxp_pos;
+    if (remaining == 0) return 0;
+    size_t n = remaining < max_len ? remaining : max_len;
+    if (rxp_chunk && n > rxp_chunk) n = rxp_chunk;
+    memcpy(data, rxp_data + rxp_pos, n);
+    rxp_pos += n;
+    return (int)n;
+}
+
+/* Build an RTU-framed message from slave address + PDU payload. */
+static void rtu_frame_from_payload(uint8_t *out, size_t *out_len,
+                                   uint8_t slave, const uint8_t *pdu, size_t pdu_len)
+{
+    out[0] = slave;
+    memcpy(out + 1, pdu, pdu_len);
+    uint16_t crc = pa_crc16(out, 1 + pdu_len);
+    out[1 + pdu_len]     = (uint8_t)(crc & 0xFF);
+    out[2 + pdu_len]     = (uint8_t)((crc >> 8) & 0xFF);
+    *out_len = 1 + pdu_len + 2;
+}
+
 static void test_raw_io(void)
 {
     printf("\n=== Raw I/O Tests ===\n");
@@ -1024,6 +1072,10 @@ static void test_raw_io(void)
     setup_default(&mb, txbuf, sizeof(txbuf), rxbuf, sizeof(rxbuf), 0x01);
     pa_modbus_set_send_cb(&mb, loopback_send_cb, NULL);
     pa_modbus_set_recv_cb(&mb, loopback_recv_cb, NULL);
+    /* Enable idle-timeout detection for the non-blocking receive tests. */
+    pa_modbus_set_ticks_cb(&mb, test_ticks_cb, NULL);
+    pa_modbus_set_rx_idle_timeout(&mb, 2);
+    test_tick = 0;
 
     /* Send raw PDU with RTU framing */
     {
@@ -1086,17 +1138,20 @@ static void test_raw_io(void)
         TEST_ASSERT(pdu_buf[2] == 0x02, "recv_raw PDU[2] = 0x02");
     }
 
-    /* Receive raw with timeout (no data) */
+    /* Receive raw with no data: non-blocking -> PA_WAIT (keep polling, not a
+     * timeout). Idle timeout only fires when bytes have been accumulated. */
     {
         loopback_rx_len = 0;
         loopback_rx_pos = 0;
+        pa_modbus_rx_reset(&mb);
         uint8_t pdu_buf[64];
         size_t pdu_len = sizeof(pdu_buf);
         int ret = pa_modbus_recv_raw(&mb, pdu_buf, &pdu_len);
-        TEST_ASSERT(ret == PA_ERR_TIMEOUT, "recv_raw timeout returns PA_ERR_TIMEOUT");
+        TEST_ASSERT(ret == PA_WAIT, "recv_raw with no data returns PA_WAIT (non-blocking)");
     }
 
-    /* Receive raw with bad CRC */
+    /* Receive raw with bad CRC: frame is accumulated but never validated, then
+     * the idle timeout discards it and the receiver is ready to resync. */
     {
         uint8_t frame[6];
         frame[0] = 0x01;
@@ -1109,17 +1164,194 @@ static void test_raw_io(void)
         memcpy(loopback_rx, frame, sizeof(frame));
         loopback_rx_len = sizeof(frame);
         loopback_rx_pos = 0;
+        pa_modbus_rx_reset(&mb);
+        test_tick = 0;
 
         uint8_t pdu_buf[64];
         size_t pdu_len = sizeof(pdu_buf);
         int ret = pa_modbus_recv_raw(&mb, pdu_buf, &pdu_len);
-        TEST_ASSERT(ret == PA_ERR_TIMEOUT, "recv_raw bad CRC returns PA_ERR_TIMEOUT (no valid frame found)");
+        TEST_ASSERT(ret == PA_WAIT, "recv_raw bad CRC accumulates and waits (no valid frame yet)");
+
+        /* Silence long enough -> stale frame discarded, ready to resync. */
+        test_tick += 10;
+        ret = pa_modbus_recv_raw(&mb, pdu_buf, &pdu_len);
+        TEST_ASSERT(ret == PA_ERR_TIMEOUT, "recv_raw bad CRC times out and resyncs");
+    }
+}
+
+/* ---------------------------------------------------------------------------
+ * Test: Non-blocking receiver (pa_modbus_recv frame assembly)
+ * ------------------------------------------------------------------------- */
+
+static void test_receiver(void)
+{
+    printf("\n=== Non-blocking Receiver Tests ===\n");
+
+    /* ---- Master: partial-then-remainder assembled across polls ---- */
+    {
+        pa_modbus_t mb;
+        uint8_t txb[256], rxb[256];
+        setup_default(&mb, txb, sizeof(txb), rxb, sizeof(rxb), 0x01);
+        pa_modbus_set_mode(&mb, PA_MODE_MASTER);
+        pa_modbus_set_ticks_cb(&mb, test_ticks_cb, NULL);
+        pa_modbus_set_rx_idle_timeout(&mb, 5);
+        pa_modbus_set_recv_cb(&mb, chunked_recv_cb, NULL);
+        test_tick = 0;
+
+        /* FC03 response, 3 registers */
+        uint8_t pdu[8] = {0x03, 0x06, 0x12,0x34, 0xAB,0xCD, 0x55,0x55};
+        uint8_t frame[16]; size_t flen;
+        rtu_frame_from_payload(frame, &flen, 0x01, pdu, sizeof(pdu));
+        TEST_ASSERT(flen == 11, "FC03 response frame length = 11");
+
+        rxp_load(frame, flen, 4); /* deliver in 4-byte chunks */
+
+        int ret = pa_modbus_recv(&mb);
+        TEST_ASSERT(ret == PA_WAIT, "partial rx: chunk 1 (4/11) -> PA_WAIT");
+        ret = pa_modbus_recv(&mb);
+        TEST_ASSERT(ret == PA_WAIT, "partial rx: chunk 2 (8/11) -> PA_WAIT");
+        ret = pa_modbus_recv(&mb);
+        TEST_ASSERT(ret == PA_OK, "partial rx: chunk 3 (11/11) -> PA_OK");
+        TEST_ASSERT(pa_modbus_get_register(&mb,0) == 0x1234, "partial rx reg0 = 0x1234");
+        TEST_ASSERT(pa_modbus_get_register(&mb,1) == 0xABCD, "partial rx reg1 = 0xABCD");
+        TEST_ASSERT(pa_modbus_get_register(&mb,2) == 0x5555, "partial rx reg2 = 0x5555");
+
+        /* frame consumed; no more data -> PA_WAIT (not a timeout) */
+        ret = pa_modbus_recv(&mb);
+        TEST_ASSERT(ret == PA_WAIT, "partial rx: buffer drained -> PA_WAIT");
+    }
+
+    /* ---- Slave: partial-then-remainder assembled across polls ---- */
+    {
+        pa_modbus_t mb;
+        uint8_t txb[256], rxb[256];
+        setup_default(&mb, txb, sizeof(txb), rxb, sizeof(rxb), 0x01);
+        pa_modbus_set_mode(&mb, PA_MODE_SLAVE);
+        pa_modbus_set_ticks_cb(&mb, test_ticks_cb, NULL);
+        pa_modbus_set_rx_idle_timeout(&mb, 5);
+        pa_modbus_set_recv_cb(&mb, chunked_recv_cb, NULL);
+        test_tick = 0;
+
+        /* FC03 request: read 2 holding regs starting at 0x000A */
+        uint8_t pdu[5] = {0x03, 0x00, 0x0A, 0x00, 0x02};
+        uint8_t frame[16]; size_t flen;
+        rtu_frame_from_payload(frame, &flen, 0x01, pdu, sizeof(pdu));
+        TEST_ASSERT(flen == 8, "FC03 request frame length = 8");
+
+        rxp_load(frame, flen, 3); /* deliver in 3-byte chunks */
+
+        int ret = pa_modbus_recv(&mb);
+        TEST_ASSERT(ret == PA_WAIT, "slave partial rx: chunk 1 -> PA_WAIT");
+        ret = pa_modbus_recv(&mb);
+        TEST_ASSERT(ret == PA_WAIT, "slave partial rx: chunk 2 -> PA_WAIT");
+        ret = pa_modbus_recv(&mb);
+        TEST_ASSERT(ret == PA_OK, "slave partial rx: chunk 3 -> PA_OK");
+        TEST_ASSERT(pa_modbus_slave_function(&mb) == 0x03, "slave partial rx fc = 0x03");
+        TEST_ASSERT(pa_modbus_slave_addr(&mb) == 0x000A, "slave partial rx addr = 0x000A");
+        TEST_ASSERT(pa_modbus_slave_count(&mb) == 2, "slave partial rx count = 2");
+        ret = pa_modbus_recv(&mb);
+        TEST_ASSERT(ret == PA_WAIT, "slave partial rx: buffer drained -> PA_WAIT");
+    }
+
+    /* ---- Idle timeout discards a stale/partial frame, then resync ---- */
+    {
+        pa_modbus_t mb;
+        uint8_t txb[256], rxb[256];
+        setup_default(&mb, txb, sizeof(txb), rxb, sizeof(rxb), 0x01);
+        pa_modbus_set_mode(&mb, PA_MODE_MASTER);
+        pa_modbus_set_ticks_cb(&mb, test_ticks_cb, NULL);
+        pa_modbus_set_rx_idle_timeout(&mb, 5);
+        pa_modbus_set_recv_cb(&mb, chunked_recv_cb, NULL);
+        test_tick = 0;
+
+        uint8_t pdu[8] = {0x03, 0x06, 0x12,0x34, 0xAB,0xCD, 0x55,0x55};
+        uint8_t frame[16]; size_t flen;
+        rtu_frame_from_payload(frame, &flen, 0x01, pdu, sizeof(pdu));
+
+        /* Only the first 4 bytes arrive, then the bus goes quiet. */
+        rxp_load(frame, 4, 4);
+        int ret = pa_modbus_recv(&mb);
+        TEST_ASSERT(ret == PA_WAIT, "idle test: partial frame awaits more data");
+
+        test_tick += 100; /* silence long enough */
+        ret = pa_modbus_recv(&mb);
+        TEST_ASSERT(ret == PA_ERR_TIMEOUT, "idle test: stale partial frame -> PA_ERR_TIMEOUT");
+
+        /* A fresh, complete, valid frame afterwards is received fine (resync). */
+        rxp_load(frame, flen, flen);
+        test_tick = 0;
+        ret = pa_modbus_recv(&mb);
+        TEST_ASSERT(ret == PA_OK, "idle test: receiver resyncs and parses next frame");
+    }
+
+    /* ---- Multi-frame in a single drain, dispatched across polls ---- */
+    {
+        pa_modbus_t mb;
+        uint8_t txb[256], rxb[256];
+        setup_default(&mb, txb, sizeof(txb), rxb, sizeof(rxb), 0x01);
+        pa_modbus_set_mode(&mb, PA_MODE_MASTER);
+        pa_modbus_set_ticks_cb(&mb, test_ticks_cb, NULL);
+        pa_modbus_set_rx_idle_timeout(&mb, 5);
+        pa_modbus_set_recv_cb(&mb, chunked_recv_cb, NULL);
+        test_tick = 0;
+
+        uint8_t pduA[6] = {0x03, 0x04, 0x11,0x11, 0x22,0x22};
+        uint8_t pduB[6] = {0x03, 0x04, 0xAA,0xAA, 0xBB,0xBB};
+        uint8_t fA[16], fB[16]; size_t la, lb;
+        rtu_frame_from_payload(fA, &la, 0x01, pduA, sizeof(pduA));
+        rtu_frame_from_payload(fB, &lb, 0x01, pduB, sizeof(pduB));
+
+        uint8_t comb[32]; size_t clen = 0;
+        memcpy(comb + clen, fA, la); clen += la;
+        memcpy(comb + clen, fB, lb); clen += lb;
+
+        rxp_load(comb, clen, 0); /* both delivered in one drain */
+
+        int ret = pa_modbus_recv(&mb);
+        TEST_ASSERT(ret == PA_OK, "multi-frame: poll1 parses first frame");
+        TEST_ASSERT(pa_modbus_get_register(&mb,0) == 0x1111, "multi-frame: first frame reg0");
+
+        ret = pa_modbus_recv(&mb);
+        TEST_ASSERT(ret == PA_OK, "multi-frame: poll2 parses second frame");
+        TEST_ASSERT(pa_modbus_get_register(&mb,0) == 0xAAAA, "multi-frame: second frame reg0");
+
+        ret = pa_modbus_recv(&mb);
+        TEST_ASSERT(ret == PA_WAIT, "multi-frame: buffer drained -> PA_WAIT");
+    }
+
+    /* ---- Garbage prefix before a valid frame is skipped (resync) ---- */
+    {
+        pa_modbus_t mb;
+        uint8_t txb[256], rxb[256];
+        setup_default(&mb, txb, sizeof(txb), rxb, sizeof(rxb), 0x01);
+        pa_modbus_set_mode(&mb, PA_MODE_MASTER);
+        pa_modbus_set_ticks_cb(&mb, test_ticks_cb, NULL);
+        pa_modbus_set_rx_idle_timeout(&mb, 5);
+        pa_modbus_set_recv_cb(&mb, chunked_recv_cb, NULL);
+        test_tick = 0;
+
+        uint8_t pdu[8] = {0x03, 0x06, 0x12,0x34, 0xAB,0xCD, 0x55,0x55};
+        uint8_t frame[16]; size_t flen;
+        rtu_frame_from_payload(frame, &flen, 0x01, pdu, sizeof(pdu));
+
+        uint8_t buf[32]; size_t blen = 0;
+        buf[blen++] = 0xEE; buf[blen++] = 0xEF; buf[blen++] = 0xF0; /* garbage */
+        memcpy(buf + blen, frame, flen); blen += flen;
+
+        rxp_load(buf, blen, 0);
+        test_tick = 0;
+
+        int ret = pa_modbus_recv(&mb);
+        TEST_ASSERT(ret == PA_OK, "garbage: receiver skips prefix and parses valid frame");
+        TEST_ASSERT(pa_modbus_get_register(&mb,0) == 0x1234, "garbage: reg0 correct after resync");
+        TEST_ASSERT(pa_modbus_get_register(&mb,2) == 0x5555, "garbage: reg2 correct after resync");
     }
 }
 
 /* ---------------------------------------------------------------------------
  * Test: FC 0x11 (Report Slave ID)
  * ------------------------------------------------------------------------- */
+
 
 static void test_report_slave_id(void)
 {
@@ -1379,6 +1611,7 @@ int main(void)
     test_framer_switch();
     test_discovery_address();
     test_raw_io();
+    test_receiver();
     test_report_slave_id();
     test_discovery_handshake();
     test_slave_address();

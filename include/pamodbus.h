@@ -34,6 +34,7 @@ typedef enum {
 /** Error codes. */
 typedef enum {
     PA_OK                =  0,  /**< Success */
+    PA_WAIT              =  1,  /**< Non-blocking receive: no complete frame yet, keep polling. */
     PA_ERR_CRC           = -1,  /**< CRC mismatch (RTU only) */
     PA_ERR_TIMEOUT       = -2,  /**< Response timeout */
     PA_ERR_INVALID_SLAVE = -3,  /**< Response slave/unit ID mismatch */
@@ -44,6 +45,19 @@ typedef enum {
     PA_ERR_STATE         = -8,  /**< Invalid state for requested operation */
     PA_ERR_CALLBACK      = -9,  /**< Callback returned error */
 } pa_error_t;
+
+/**
+ * Receive/parse role.
+ *
+ * Determines how received bytes are dispatched once a full frame is assembled.
+ * Previously this was inferred from whether write callbacks were registered;
+ * it is now explicit and must be set by the application via
+ * pa_modbus_set_mode(). A legacy heuristic remains when it is not set.
+ */
+typedef enum {
+    PA_MODE_MASTER = 0,  /**< Parse slave responses (master role). */
+    PA_MODE_SLAVE  = 1,  /**< Parse master requests (slave role). */
+} pa_modbus_mode_t;
 
 /** MODBUS exception codes. */
 typedef enum {
@@ -71,12 +85,16 @@ typedef enum {
  */
 typedef int (*pa_send_fn)(const uint8_t *data, size_t len, void *userdata);
 
+/** Get a monotonic tick counter (used for receive idle framing/timeout). */
+typedef uint32_t (*pa_ticks_fn)(void *userdata);
+
 /**
  * Receive raw bytes.
- * @param data    Buffer to fill.
- * @param max_len Maximum number of bytes to receive.
- * @param userdata  User-supplied pointer.
- * @return Number of bytes received, 0 on timeout, negative on error.
+ *
+ * This callback MUST be non-blocking. It should copy whatever is currently
+ * available (up to max_len) into data and return the number of bytes copied.
+ * A return of 0 means "no data available right now" — the caller must poll
+ * again later; it is NOT itself a timeout. Negative on error.
  */
 typedef int (*pa_recv_fn)(uint8_t *data, size_t max_len, void *userdata);
 
@@ -266,8 +284,27 @@ int pa_modbus_slave_respond_error(pa_modbus_t *ctx, uint8_t exception_code);
  /** Send the TX buffer using the registered send callback. */
 int pa_modbus_send(pa_modbus_t *ctx);
 
-/** Receive data and feed it to the active parser (master or slave). */
+/**
+ * Non-blocking receive: accumulate bytes into ctx->rxbuf until a complete
+ * framed message has been assembled, then parse and dispatch it.
+ *
+ * The receive callback is drained once per call (it must be non-blocking).
+ * Partial frames are retained across calls so a message received in chunks is
+ * assembled over successive polls. Only once the full frame is present is it
+ * parsed and dispatched to the master/slave parser.
+ *
+ * @return PA_OK      a complete frame was parsed (call pa_modbus_slave_respond
+ *                    in slave mode, or read the response in master mode).
+ * @return PA_WAIT    no complete frame yet — keep polling (not an error).
+ * @return PA_ERR_TIMEOUT  idle timeout elapsed on a partial/stale frame; the
+ *                    accumulator has been discarded and the receiver resynced.
+ * @return negative   hard error (CRC, protocol, buffer overflow, etc.).
+ *                    The accumulator is reset so the next poll starts fresh.
+ */
 int pa_modbus_recv(pa_modbus_t *ctx);
+
+/** Reset the receive frame accumulator (e.g. before starting a new transaction). */
+void pa_modbus_rx_reset(pa_modbus_t *ctx);
 
 /**
  * Send raw bytes with framing applied.
@@ -281,14 +318,43 @@ int pa_modbus_recv(pa_modbus_t *ctx);
 int pa_modbus_send_raw(pa_modbus_t *ctx, const uint8_t *pdu, size_t pdu_len);
 
 /**
- * Receive raw bytes and strip framing.
- * Blocks until a valid framed message is received.
+ * Non-blocking raw receive: accumulate bytes until a CRC-valid framed message
+ * is present, then strip framing and copy the PDU out.
+ *
  * @param ctx       The MODBUS context.
  * @param pdu_buf   Buffer to receive the PDU (framing stripped).
  * @param pdu_len   In: capacity of pdu_buf. Out: actual PDU length received.
- * @return PA_OK on success, or negative pa_error_t on failure.
+ * @return PA_OK on success, PA_WAIT while still assembling (keep polling),
+ *         or negative pa_error_t on failure/timeout.
  */
 int pa_modbus_recv_raw(pa_modbus_t *ctx, uint8_t *pdu_buf, size_t *pdu_len);
+
+/* ---------------------------------------------------------------------------
+ * Receive state control (role, timing, framing)
+ * ------------------------------------------------------------------------- */
+
+/** Set the receive/parse role (master or slave). */
+void pa_modbus_set_mode(pa_modbus_t *ctx, pa_modbus_mode_t mode);
+
+/** Get the configured receive/parse role. */
+pa_modbus_mode_t pa_modbus_get_mode(const pa_modbus_t *ctx);
+
+/**
+ * Set a monotonic tick callback used to detect receive idle gaps / timeouts.
+ * Without it, partial or stale frames can never time out (they keep being
+ * accumulated); a full frame is still detected regardless.
+ */
+void pa_modbus_set_ticks_cb(pa_modbus_t *ctx, pa_ticks_fn ticks, void *userdata);
+
+/**
+ * Set the idle timeout in ticks. If no new bytes arrive for this many ticks
+ * while a frame is being assembled, the accumulated bytes are treated as a
+ * stale/partial frame, discarded, and pa_modbus_recv()/pa_modbus_recv_raw()
+ * return PA_ERR_TIMEOUT. For Modbus RTU this should approximate the 3.5-
+ * character inter-frame silent interval (plus margin).
+ */
+void pa_modbus_set_rx_idle_timeout(pa_modbus_t *ctx, uint32_t ticks);
+
 
 /* ---------------------------------------------------------------------------
  * CRC-16

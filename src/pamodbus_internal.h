@@ -74,6 +74,13 @@ struct pa_modbus {
     uint8_t            slave;       /**< Slave/unit identifier. */
     uint8_t            discovery_addr; /**< Secondary listen address (0 = disabled, typically 0xF8-0xFF). */
 
+    /* --- Role / timing (non-blocking receive) --- */
+    pa_modbus_mode_t   mode;            /**< Receive/parse role. */
+    int                mode_set;        /**< Non-zero once mode was set explicitly. */
+    pa_ticks_fn        ticks_cb;        /**< Monotonic tick source for idle timeout. */
+    void              *ticks_userdata;  /**< Opaque arg for ticks_cb. */
+    uint32_t           idle_timeout_ticks; /**< Idle gap (ticks) before a partial frame is discarded. */
+
     /* --- I/O callbacks --- */
     pa_send_fn send_cb;
     void      *send_userdata;
@@ -103,6 +110,7 @@ struct pa_modbus {
 
     /* --- Parse state --- */
     size_t rx_len;     /**< Number of valid bytes currently in rxbuf. */
+    uint32_t last_rx_tick; /**< Tick when the last byte was appended (idle timeout). */
 
     /* --- Last parse result (master responses) --- */
     pa_error_t last_error;

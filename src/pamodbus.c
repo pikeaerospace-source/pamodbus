@@ -18,6 +18,14 @@ void pa_modbus_init(pa_modbus_t *ctx)
     ctx->slave = 0xFF; /* Respond to all by default */
     ctx->discovery_addr = 0; /* Disabled by default */
     ctx->last_error = PA_OK;
+
+    /* Receive state defaults. mode is left unset (legacy heuristic active)
+     * until pa_modbus_set_mode() is called. */
+    ctx->mode = PA_MODE_MASTER;
+    ctx->mode_set = 0;
+    ctx->ticks_cb = NULL;
+    ctx->ticks_userdata = NULL;
+    ctx->idle_timeout_ticks = 10; /* Only used once ticks_cb is set. */
 }
 
 /* ---------------------------------------------------------------------------
@@ -84,6 +92,37 @@ void pa_modbus_set_discovery_addr(pa_modbus_t *ctx, uint8_t addr)
 uint8_t pa_modbus_get_discovery_addr(const pa_modbus_t *ctx)
 {
     return ctx->discovery_addr;
+}
+
+/* ---------------------------------------------------------------------------
+ * Receive role / timing
+ * ------------------------------------------------------------------------- */
+
+void pa_modbus_set_mode(pa_modbus_t *ctx, pa_modbus_mode_t mode)
+{
+    ctx->mode = mode;
+    ctx->mode_set = 1;
+}
+
+pa_modbus_mode_t pa_modbus_get_mode(const pa_modbus_t *ctx)
+{
+    return ctx->mode;
+}
+
+void pa_modbus_set_ticks_cb(pa_modbus_t *ctx, pa_ticks_fn ticks, void *userdata)
+{
+    ctx->ticks_cb = ticks;
+    ctx->ticks_userdata = userdata;
+}
+
+void pa_modbus_set_rx_idle_timeout(pa_modbus_t *ctx, uint32_t ticks)
+{
+    ctx->idle_timeout_ticks = ticks;
+}
+
+void pa_modbus_rx_reset(pa_modbus_t *ctx)
+{
+    ctx->rx_len = 0;
 }
 
 /* ---------------------------------------------------------------------------
@@ -236,31 +275,99 @@ int pa_modbus_send(pa_modbus_t *ctx)
     return (ret == 0) ? PA_OK : PA_ERR_CALLBACK;
 }
 
+/* Select the receive/parse role: explicit mode if set, else a legacy
+ * heuristic (write callbacks registered => slave, else master). */
+static pa_modbus_mode_t pa_rx_mode(const pa_modbus_t *ctx)
+{
+    if (ctx->mode_set)
+        return ctx->mode;
+    if (ctx->write_single_coil_cb || ctx->write_single_register_cb ||
+        ctx->write_multiple_coils_cb || ctx->write_multiple_registers_cb)
+        return PA_MODE_SLAVE;
+    return PA_MODE_MASTER;
+}
+
+/* Scan the accumulator for a complete, validated framed message.
+ * On success returns PA_OK and reports where it starts (start) and its total
+ * length including framing (frame_len). Returns PA_WAIT if no complete frame
+ * is present yet. Scanning from every offset makes the receiver robust to a
+ * garbage/stale prefix before a real frame (resync). */
+static int pa_rx_scan_frame(pa_modbus_t *ctx, size_t *start, size_t *frame_len)
+{
+    for (size_t off = 0; off < ctx->rx_len; off++) {
+        const uint8_t *pdu;
+        size_t pdu_len;
+        int r = ctx->framer->unwrap(ctx, ctx->rxbuf + off, ctx->rx_len - off,
+                                    &pdu, &pdu_len);
+        if (r == PA_OK) {
+            *start = off;
+            /* Full frame length = bytes before the PDU + PDU + trailing CRC (RTU). */
+            *frame_len = (size_t)(pdu - (ctx->rxbuf + off)) + pdu_len;
+            if (ctx->framer_type == PA_FRAMER_RTU)
+                *frame_len += 2; /* trailing CRC-16 */
+            return PA_OK;
+        }
+        /* unwrap returned "need more" (r > 0) or an error (r < 0): not a
+         * complete frame at this offset; keep scanning. */
+    }
+    return PA_WAIT;
+}
+
 int pa_modbus_recv(pa_modbus_t *ctx)
 {
-    if (!ctx->recv_cb)
+    if (!ctx->recv_cb || !ctx->rxbuf || ctx->rxbuf_size == 0)
         return PA_ERR_STATE;
 
-    int n = ctx->recv_cb(ctx->rxbuf, ctx->rxbuf_size, ctx->recv_userdata);
+    uint32_t now = ctx->ticks_cb ? ctx->ticks_cb(ctx->ticks_userdata) : 0;
+
+    /* 1. Non-blocking append of whatever is currently available. */
+    int n = ctx->recv_cb(ctx->rxbuf + ctx->rx_len,
+                         ctx->rxbuf_size - ctx->rx_len,
+                         ctx->recv_userdata);
     if (n < 0)
         return PA_ERR_CALLBACK;
-    if (n == 0)
-        return PA_ERR_TIMEOUT;
-
-    /* Feed to the appropriate parser.
-     * We determine mode based on whether slave callbacks are registered
-     * as a heuristic. A more robust approach would require the user to
-     * explicitly set the mode, but this keeps the API simple.
-     *
-     * If any write callback is registered, assume slave mode.
-     * Otherwise, assume master mode.
-     */
-    if (ctx->write_single_coil_cb || ctx->write_single_register_cb ||
-        ctx->write_multiple_coils_cb || ctx->write_multiple_registers_cb) {
-        return pa_modbus_slave_feed(ctx, ctx->rxbuf, (size_t)n);
-    } else {
-        return pa_modbus_master_feed(ctx, ctx->rxbuf, (size_t)n);
+    if (n > 0) {
+        ctx->rx_len += (size_t)n;
+        ctx->last_rx_tick = now;
     }
+
+    /* 2. Try to finalize a complete, validated frame from the accumulator. */
+    if (ctx->rx_len > 0) {
+        size_t start, frame_len;
+        if (pa_rx_scan_frame(ctx, &start, &frame_len) == PA_OK) {
+            /* Parse and dispatch now that the full frame is present. */
+            int ret = (pa_rx_mode(ctx) == PA_MODE_SLAVE)
+                ? pa_modbus_slave_feed(ctx, ctx->rxbuf + start, frame_len)
+                : pa_modbus_master_feed(ctx, ctx->rxbuf + start, frame_len);
+
+            /* Consume the framed message; keep any trailing bytes so a
+             * back-to-back frame in the same drain is handled next poll. */
+            size_t consumed = start + frame_len;
+            size_t remaining = ctx->rx_len - consumed;
+            if (remaining > 0) {
+                memmove(ctx->rxbuf, ctx->rxbuf + consumed, remaining);
+                ctx->last_rx_tick = now;
+            }
+            ctx->rx_len = remaining;
+            return ret;
+        }
+
+        /* Partial bytes present but no complete frame yet: guard overflow. */
+        if (ctx->rx_len >= ctx->rxbuf_size) {
+            ctx->rx_len = 0;
+            return PA_ERR_BUFFER_FULL;
+        }
+    }
+
+    /* 3. Idle timeout: enough silence that the partial bytes must be a
+     *    stale/garbage frame; discard them and resync. */
+    if (ctx->ticks_cb && ctx->rx_len > 0 &&
+        (uint32_t)(now - ctx->last_rx_tick) >= ctx->idle_timeout_ticks) {
+        ctx->rx_len = 0;
+        return PA_ERR_TIMEOUT;
+    }
+
+    return PA_WAIT; /* keep polling, nothing complete yet */
 }
 
 /* ---------------------------------------------------------------------------
@@ -296,52 +403,53 @@ int pa_modbus_recv_raw(pa_modbus_t *ctx, uint8_t *pdu_buf, size_t *pdu_len)
 {
     if (!ctx->recv_cb)
         return PA_ERR_STATE;
-    if (!ctx->rxbuf || !pdu_buf || !pdu_len)
+    if (!ctx->rxbuf || ctx->rxbuf_size == 0 || !pdu_buf || !pdu_len)
         return PA_ERR_BAD_PARAM;
 
-    size_t capacity = *pdu_len;
-    size_t total = 0;
+    uint32_t now = ctx->ticks_cb ? ctx->ticks_cb(ctx->ticks_userdata) : 0;
 
-    /* Accumulate bytes until a valid framed message is received.
-     * For raw I/O, we use a simpler approach than the framer's unwrap:
-     * we accumulate bytes and try to find a valid frame by checking
-     * the CRC at each possible frame length. This works for custom
-     * protocol frames (e.g., discovery) that don't follow standard
-     * MODBUS function code length rules. */
-    for (;;) {
-        int n = ctx->recv_cb(ctx->rxbuf + total, ctx->rxbuf_size - total, ctx->recv_userdata);
-        if (n < 0)
-            return PA_ERR_CALLBACK;
-        if (n == 0)
-            return PA_ERR_TIMEOUT;
+    /* Non-blocking append of whatever is currently available. */
+    int n = ctx->recv_cb(ctx->rxbuf + ctx->rx_len,
+                         ctx->rxbuf_size - ctx->rx_len,
+                         ctx->recv_userdata);
+    if (n < 0)
+        return PA_ERR_CALLBACK;
+    if (n > 0) {
+        ctx->rx_len += (size_t)n;
+        ctx->last_rx_tick = now;
+    }
 
-        total += (size_t)n;
-
-        /* Minimum frame: slave(1) + fc(1) + crc(2) = 4 bytes */
-        if (total >= 4) {
-            /* Try to find a valid frame by checking CRC at each possible length.
-             * The frame is: slave(1) + PDU(N) + crc(2).
-             * We try lengths from 4 up to total, checking if the CRC matches. */
-            for (size_t frame_len = 4; frame_len <= total; frame_len++) {
-                /* Verify CRC for this frame length */
-                uint16_t crc_received = (uint16_t)(ctx->rxbuf[frame_len - 2] |
-                                                   ((uint16_t)ctx->rxbuf[frame_len - 1] << 8));
-                uint16_t crc_calc = pa_crc16(ctx->rxbuf, frame_len - 2);
-
-                if (crc_calc == crc_received) {
-                    /* Valid frame found — extract PDU (after slave addr, before CRC) */
-                    size_t pdu_len_out = frame_len - 1 - 2; /* subtract slave and CRC */
-                    if (pdu_len_out > capacity)
-                        return PA_ERR_BUFFER_FULL;
-                    memcpy(pdu_buf, ctx->rxbuf + 1, pdu_len_out);
-                    *pdu_len = pdu_len_out;
-                    return PA_OK;
-                }
+    /* Custom protocol frames don't follow standard MODBUS length rules, so we
+     * locate them by scanning for a CRC-valid frame length. The frame starts at
+     * rxbuf[0] (frame: slave(1) + PDU(N) + crc(2)). */
+    if (ctx->rx_len >= 4) {
+        for (size_t frame_len = 4; frame_len <= ctx->rx_len; frame_len++) {
+            uint16_t crc_received = (uint16_t)(ctx->rxbuf[frame_len - 2] |
+                                               ((uint16_t)ctx->rxbuf[frame_len - 1] << 8));
+            if (pa_crc16(ctx->rxbuf, frame_len - 2) == crc_received) {
+                size_t pdu_len_out = frame_len - 3; /* subtract slave(1) + crc(2) */
+                if (pdu_len_out > *pdu_len)
+                    return PA_ERR_BUFFER_FULL;
+                memcpy(pdu_buf, ctx->rxbuf + 1, pdu_len_out);
+                *pdu_len = pdu_len_out;
+                ctx->rx_len = 0; /* consume the frame */
+                return PA_OK;
             }
         }
-
-        /* Check if we've filled the buffer without finding a valid frame */
-        if (total >= ctx->rxbuf_size)
-            return PA_ERR_BUFFER_FULL;
     }
+
+    /* Accumulated bytes but no valid frame yet: guard overflow. */
+    if (ctx->rx_len >= ctx->rxbuf_size) {
+        ctx->rx_len = 0;
+        return PA_ERR_BUFFER_FULL;
+    }
+
+    /* Idle timeout: discard a stale/partial frame and resync. */
+    if (ctx->ticks_cb && ctx->rx_len > 0 &&
+        (uint32_t)(now - ctx->last_rx_tick) >= ctx->idle_timeout_ticks) {
+        ctx->rx_len = 0;
+        return PA_ERR_TIMEOUT;
+    }
+
+    return PA_WAIT; /* keep polling */
 }
