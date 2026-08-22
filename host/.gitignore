@@ -1,0 +1,4 @@
+# Build artifacts (see Makefile)
+master_disco
+slave_disco
+*.o
